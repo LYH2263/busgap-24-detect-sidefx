@@ -14,8 +14,8 @@ def list_reports(db: Session = Depends(get_db)):
     return [{"id": r.id, "line_id": r.line_id, "stop_name": r.stop_name,
              "created_at": r.created_at.isoformat(), "events": json.loads(r.summary_json)} for r in rows]
 
-@router.post("/run")
-def run_detection(line_id: int, stop_name: str | None = None, db: Session = Depends(get_db)):
+def _detect_events(db: Session, line_id: int, stop_name: str | None) -> list[dict]:
+    """纯计算间隔事件:真检与试算共用,本身不落库。"""
     line = db.get(Line, line_id)
     if not line: raise HTTPException(404, "线路不存在")
     trips = db.scalars(select(Trip).where(Trip.line_id == line_id)).all()
@@ -25,7 +25,12 @@ def run_detection(line_id: int, stop_name: str | None = None, db: Session = Depe
     payload = [{"stop_name": a.stop_name, "trip_no": trip_no_map[a.trip_id], "actual_arrive": a.actual_arrive}
                for a in arrivals if stop_name is None or a.stop_name == stop_name]
     events = detect_bunching(payload, line.planned_headway_min, line.bunch_threshold, line.large_threshold)
-    data = events_to_dicts(events)
+    return events_to_dicts(events)
+
+@router.post("/run")
+def run_detection(line_id: int, stop_name: str | None = None, db: Session = Depends(get_db)):
+    """真检:计算间隔事件并写入一份报告(副作用:报告表 +1)。"""
+    data = _detect_events(db, line_id, stop_name)
     report = BunchReport(line_id=line_id, stop_name=stop_name or "*", created_at=datetime.utcnow(),
                          summary_json=json.dumps(data, ensure_ascii=False))
     db.add(report); db.commit(); db.refresh(report)
@@ -33,8 +38,9 @@ def run_detection(line_id: int, stop_name: str | None = None, db: Session = Depe
 
 @router.get("/suggestions")
 def suggestions(line_id: int, db: Session = Depends(get_db)):
-    result = run_detection(line_id=line_id, stop_name=None, db=db)
-    return {"line_id": line_id, "suggestions": [e for e in result["events"] if e["status"] != "normal"]}
+    """试算:只算不写,报告表与时间轴零增量。"""
+    events = _detect_events(db, line_id, None)
+    return {"line_id": line_id, "suggestions": [e for e in events if e["status"] != "normal"]}
 
 @router.get("/timeline")
 def timeline(line_id: int, stop_name: str = "市民中心", db: Session = Depends(get_db)):
